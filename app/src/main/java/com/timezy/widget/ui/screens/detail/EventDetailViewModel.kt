@@ -66,7 +66,7 @@ class EventDetailViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             repository.deleteEventById(current.id)
             ReminderScheduler.cancelReminder(getApplication(), current.id)
-            WidgetUpdateHelper.updateAllWidgets(getApplication())
+            WidgetUpdateHelper.handleEventDeletedSync(getApplication(), current.id)
             _isDeleted.value = true
         }
     }

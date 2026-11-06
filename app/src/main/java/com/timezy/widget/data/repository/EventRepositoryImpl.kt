@@ -1,16 +1,20 @@
 package com.timezy.widget.data.repository
 
+import android.content.Context
 import androidx.lifecycle.asFlow
+import com.timezy.widget.CountdownApplication
 import com.timezy.widget.data.database.EventDao
 import com.timezy.widget.data.database.EventEntity
 import com.timezy.widget.data.model.CountdownEvent
+import com.timezy.widget.widget.WidgetUpdateHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
 class EventRepositoryImpl(
-    private val eventDao: EventDao
+    private val eventDao: EventDao,
+    private val context: Context? = null
 ) : EventRepository {
 
     override fun getAllEventsFlow(): Flow<List<CountdownEvent>> {
@@ -49,10 +53,18 @@ class EventRepositoryImpl(
 
     override suspend fun deleteEvent(event: CountdownEvent): Unit = withContext(Dispatchers.IO) {
         eventDao.deleteEvent(EventEntity.fromDomain(event))
+        val appContext = context ?: try { CountdownApplication.instance } catch (_: Exception) { null }
+        if (appContext != null) {
+            WidgetUpdateHelper.handleEventDeletedSync(appContext, event.id)
+        }
     }
 
     override suspend fun deleteEventById(id: Long) = withContext(Dispatchers.IO) {
         eventDao.deleteEventById(id)
+        val appContext = context ?: try { CountdownApplication.instance } catch (_: Exception) { null }
+        if (appContext != null) {
+            WidgetUpdateHelper.handleEventDeletedSync(appContext, id)
+        }
         return@withContext
     }
 
@@ -63,6 +75,10 @@ class EventRepositoryImpl(
 
     override suspend fun clearAllEvents() = withContext(Dispatchers.IO) {
         eventDao.clearAllEvents()
+        val appContext = context ?: try { CountdownApplication.instance } catch (_: Exception) { null }
+        if (appContext != null) {
+            WidgetUpdateHelper.handleAllEventsClearedSync(appContext)
+        }
         return@withContext
     }
 }

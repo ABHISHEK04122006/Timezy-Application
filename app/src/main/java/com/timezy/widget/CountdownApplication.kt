@@ -25,7 +25,7 @@ class CountdownApplication : Application() {
     }
 
     val repository: EventRepository by lazy {
-        EventRepositoryImpl(database.eventDao())
+        EventRepositoryImpl(database.eventDao(), this)
     }
 
     val preferences: AppPreferences by lazy {

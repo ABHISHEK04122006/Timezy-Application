@@ -90,7 +90,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun clearAllData() {
         viewModelScope.launch {
             repository.clearAllEvents()
-            WidgetUpdateHelper.updateAllWidgets(getApplication())
+            WidgetUpdateHelper.handleAllEventsClearedSync(getApplication())
             _uiState.update {
                 it.copy(showClearDataDialog = false, dataCleared = true)
             }

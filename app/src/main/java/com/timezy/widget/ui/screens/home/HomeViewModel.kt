@@ -240,7 +240,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repository.deleteEventById(event.id)
             ReminderScheduler.cancelReminder(getApplication(), event.id)
-            WidgetUpdateHelper.updateAllWidgets(getApplication())
+            WidgetUpdateHelper.handleEventDeletedSync(getApplication(), event.id)
             _eventToDelete.value = null
         }
     }

@@ -45,16 +45,29 @@ object WidgetUpdateHelper {
     private const val REQUEST_CODE_SCHEDULED_UPDATE = 7701
     private var lastUpdateTime = 0L
 
+    const val EVENT_ID_AUTO = -1L
+    const val EVENT_ID_UNASSIGNED = -2L
+
     private const val PREFS_NAME = "countdown_widget_prefs"
     private const val PREF_PREFIX_KEY = "appwidget_event_"
     private const val PREF_STYLE_KEY = "appwidget_style_"
     private const val PREF_COLOR_KEY = "appwidget_color_"
     private const val PREF_SHOW_SECONDS_KEY = "appwidget_show_seconds_"
     private const val PREF_LIQUID_GLASS_KEY = "appwidget_liquid_glass_"
+    private const val PREF_AUTO_MODE_KEY = "appwidget_auto_mode_"
 
     @Volatile var prefsOverrideForTesting: SharedPreferences? = null
+    @Volatile var isWidgetRemovalSupportedForTesting: Boolean? = null
+    @Volatile var installedWidgetIdsOverrideForTesting: List<Int>? = null
+    @Volatile var eventDaoOverrideForTesting: com.timezy.widget.data.database.EventDao? = null
 
-    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+    private val mainHandler by lazy {
+        try {
+            Handler(Looper.getMainLooper())
+        } catch (_: Exception) {
+            null
+        }
+    }
     @Volatile private var isTickerRunning = false
     private var applicationContext: Context? = null
     internal val eventCache = ConcurrentHashMap<Int, CountdownEvent>()
@@ -67,6 +80,15 @@ object WidgetUpdateHelper {
         eventCache.clear()
     }
 
+    fun getEventDao(context: Context): com.timezy.widget.data.database.EventDao? {
+        eventDaoOverrideForTesting?.let { return it }
+        return try {
+            AppDatabase.getInstance(context).eventDao()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun getPrefs(context: Context?): SharedPreferences {
         return prefsOverrideForTesting ?: context?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             ?: throw IllegalStateException("Context must not be null when prefsOverrideForTesting is not set")
@@ -74,13 +96,45 @@ object WidgetUpdateHelper {
 
     @JvmOverloads
     fun setWidgetEventId(context: Context? = null, appWidgetId: Int, eventId: Long) {
-        getPrefs(context).edit().putLong(PREF_PREFIX_KEY + appWidgetId, eventId).apply()
+        val editor = getPrefs(context).edit()
+        if (eventId > 0L) {
+            editor.putLong(PREF_PREFIX_KEY + appWidgetId, eventId)
+            editor.putBoolean(PREF_AUTO_MODE_KEY + appWidgetId, false)
+        } else if (eventId == EVENT_ID_AUTO) {
+            editor.putLong(PREF_PREFIX_KEY + appWidgetId, EVENT_ID_AUTO)
+            editor.putBoolean(PREF_AUTO_MODE_KEY + appWidgetId, true)
+        } else {
+            editor.putLong(PREF_PREFIX_KEY + appWidgetId, EVENT_ID_UNASSIGNED)
+            editor.putBoolean(PREF_AUTO_MODE_KEY + appWidgetId, false)
+        }
+        editor.apply()
         invalidateEventCache()
     }
 
     @JvmOverloads
     fun getWidgetEventId(context: Context? = null, appWidgetId: Int): Long {
-        return getPrefs(context).getLong(PREF_PREFIX_KEY + appWidgetId, -1L)
+        val raw = getPrefs(context).getLong(PREF_PREFIX_KEY + appWidgetId, EVENT_ID_AUTO)
+        return if (raw <= 0L) EVENT_ID_AUTO else raw
+    }
+
+    @JvmOverloads
+    fun getRawWidgetEventId(context: Context? = null, appWidgetId: Int): Long {
+        return getPrefs(context).getLong(PREF_PREFIX_KEY + appWidgetId, EVENT_ID_AUTO)
+    }
+
+    @JvmOverloads
+    fun isWidgetAutoMode(context: Context? = null, appWidgetId: Int): Boolean {
+        return getPrefs(context).getBoolean(PREF_AUTO_MODE_KEY + appWidgetId, false)
+    }
+
+    @JvmOverloads
+    fun clearWidgetEventId(context: Context? = null, appWidgetId: Int) {
+        getPrefs(context).edit()
+            .putLong(PREF_PREFIX_KEY + appWidgetId, EVENT_ID_UNASSIGNED)
+            .putBoolean(PREF_AUTO_MODE_KEY + appWidgetId, false)
+            .remove(PREF_COLOR_KEY + appWidgetId)
+            .apply()
+        eventCache.remove(appWidgetId)
     }
 
     @JvmOverloads
@@ -196,6 +250,7 @@ object WidgetUpdateHelper {
     fun deleteWidgetPref(context: Context? = null, appWidgetId: Int) {
         getPrefs(context).edit()
             .remove(PREF_PREFIX_KEY + appWidgetId)
+            .remove(PREF_AUTO_MODE_KEY + appWidgetId)
             .remove(PREF_COLOR_KEY + appWidgetId)
             .remove(PREF_STYLE_KEY + appWidgetId)
             .remove(PREF_SHOW_SECONDS_KEY + appWidgetId)
@@ -204,28 +259,79 @@ object WidgetUpdateHelper {
         eventCache.remove(appWidgetId)
     }
 
-    fun hasActiveWidgets(context: Context): Boolean {
+    fun getAllInstalledWidgetIds(context: Context?): List<Int> {
+        installedWidgetIdsOverrideForTesting?.let { return it }
+        if (context == null) return emptyList()
         return try {
             val appWidgetManager = AppWidgetManager.getInstance(context)
             val circleIds = appWidgetManager.getAppWidgetIds(ComponentName(context, CircleCountdownWidgetProvider::class.java))
             val mediumIds = appWidgetManager.getAppWidgetIds(ComponentName(context, MediumCountdownWidgetProvider::class.java))
-            circleIds.isNotEmpty() || mediumIds.isNotEmpty()
+            (circleIds + mediumIds).distinct()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Checks whether the current launcher supports programmatic removal of pinned home-screen widgets.
+     * In the standard Android AppWidget framework, provider apps cannot forcibly delete pinned widgets
+     * from third-party or system launchers (only the host or the user manually can do so).
+     */
+    fun isWidgetRemovalSupportedByLauncher(context: Context? = null): Boolean {
+        isWidgetRemovalSupportedForTesting?.let { return it }
+        return false
+    }
+
+    data class WidgetRemovalResult(
+        val appWidgetId: Int,
+        val isRemoved: Boolean,
+        val launcherLimitation: String? = null
+    )
+
+    fun removeWidgetInstanceIfSupported(context: Context? = null, appWidgetId: Int): WidgetRemovalResult {
+        val supported = isWidgetRemovalSupportedByLauncher(context)
+        return if (supported) {
+            deleteWidgetPref(context, appWidgetId)
+            WidgetRemovalResult(
+                appWidgetId = appWidgetId,
+                isRemoved = true,
+                launcherLimitation = null
+            )
+        } else {
+            WidgetRemovalResult(
+                appWidgetId = appWidgetId,
+                isRemoved = false,
+                launcherLimitation = "Android launcher limitation: Third-party apps cannot forcibly remove pinned widgets from the launcher. Obsolete widgets must be manually removed by the user from their home screen."
+            )
+        }
+    }
+
+    fun hasActiveWidgets(context: Context): Boolean {
+        return getAllInstalledWidgetIds(context).isNotEmpty()
+    }
+
+    fun anyWidgetHasSecondsEnabled(context: Context): Boolean {
+        return try {
+            val allIds = getAllInstalledWidgetIds(context)
+            if (allIds.isEmpty()) return false
+            for (id in allIds) {
+                if (isWidgetShowSecondsEnabled(context, id)) return true
+            }
+            false
         } catch (_: Exception) {
             false
         }
     }
 
-    fun anyWidgetHasSecondsEnabled(context: Context): Boolean {
+    fun anyWidgetHasActiveCountdownWithSeconds(context: Context): Boolean {
         return try {
-            val appWidgetManager = AppWidgetManager.getInstance(context)
-            val circleIds = appWidgetManager.getAppWidgetIds(ComponentName(context, CircleCountdownWidgetProvider::class.java))
-            val mediumIds = appWidgetManager.getAppWidgetIds(ComponentName(context, MediumCountdownWidgetProvider::class.java))
-            if (circleIds.isEmpty() && mediumIds.isEmpty()) return false
-            for (id in circleIds) {
-                if (isWidgetShowSecondsEnabled(context, id)) return true
-            }
-            for (id in mediumIds) {
-                if (isWidgetShowSecondsEnabled(context, id)) return true
+            val allIds = getAllInstalledWidgetIds(context)
+            if (allIds.isEmpty()) return false
+            for (id in allIds) {
+                if (isWidgetShowSecondsEnabled(context, id)) {
+                    val event = eventCache[id] ?: try { resolveEventForWidgetSync(context, id) } catch (_: Exception) { null }
+                    if (event != null) return true
+                }
             }
             false
         } catch (_: Exception) {
@@ -237,13 +343,13 @@ object WidgetUpdateHelper {
         val appContext = context.applicationContext
         applicationContext = appContext
 
-        if (!hasActiveWidgets(appContext) || !anyWidgetHasSecondsEnabled(appContext)) {
+        if (!hasActiveWidgets(appContext) || !anyWidgetHasActiveCountdownWithSeconds(appContext)) {
             stopLiveTicker()
             return
         }
 
-        val powerManager = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
-        if (powerManager?.isInteractive != true) {
+        val powerManager = try { appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager } catch (_: Exception) { null }
+        if (powerManager != null && !powerManager.isInteractive) {
             stopLiveTicker()
             return
         }
@@ -251,13 +357,13 @@ object WidgetUpdateHelper {
         if (isTickerRunning) return
         isTickerRunning = true
 
-        mainHandler.removeCallbacks(tickerRunnable)
-        mainHandler.post(tickerRunnable)
+        mainHandler?.removeCallbacks(tickerRunnable)
+        mainHandler?.post(tickerRunnable)
     }
 
     fun stopLiveTicker() {
         isTickerRunning = false
-        mainHandler.removeCallbacks(tickerRunnable)
+        mainHandler?.removeCallbacks(tickerRunnable)
     }
 
     private val tickerRunnable = object : Runnable {
@@ -265,14 +371,14 @@ object WidgetUpdateHelper {
             val context = applicationContext ?: return
             if (!isTickerRunning) return
 
-            val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
-            if (powerManager?.isInteractive != true) {
+            val powerManager = try { context.getSystemService(Context.POWER_SERVICE) as? PowerManager } catch (_: Exception) { null }
+            if (powerManager != null && !powerManager.isInteractive) {
                 stopLiveTicker()
                 scheduleNextWidgetUpdate(context)
                 return
             }
 
-            if (!hasActiveWidgets(context) || !anyWidgetHasSecondsEnabled(context)) {
+            if (!hasActiveWidgets(context) || !anyWidgetHasActiveCountdownWithSeconds(context)) {
                 stopLiveTicker()
                 return
             }
@@ -284,7 +390,7 @@ object WidgetUpdateHelper {
             val now = System.currentTimeMillis()
             val delayToNextSecond = 1000L - (now % 1000L)
             val targetDelay = if (delayToNextSecond < 50L) delayToNextSecond + 1000L else delayToNextSecond
-            mainHandler.postDelayed(this, targetDelay)
+            mainHandler?.postDelayed(this, targetDelay)
         }
     }
 
@@ -1210,15 +1316,12 @@ object WidgetUpdateHelper {
     }
 
     private fun getAssignedEventIds(context: Context, excludeWidgetId: Int): Set<Long> {
-        val appWidgetManager = AppWidgetManager.getInstance(context)
-        val circleIds = appWidgetManager.getAppWidgetIds(ComponentName(context, CircleCountdownWidgetProvider::class.java))
-        val mediumIds = appWidgetManager.getAppWidgetIds(ComponentName(context, MediumCountdownWidgetProvider::class.java))
-        val allIds = circleIds + mediumIds
+        val allIds = getAllInstalledWidgetIds(context)
         val assigned = mutableSetOf<Long>()
         for (id in allIds) {
             if (id != excludeWidgetId) {
                 val eventId = getWidgetEventId(context, id)
-                if (eventId != -1L) {
+                if (eventId != EVENT_ID_AUTO && eventId != EVENT_ID_UNASSIGNED && eventId > 0L) {
                     assigned.add(eventId)
                 }
             }
@@ -1226,23 +1329,33 @@ object WidgetUpdateHelper {
         return assigned
     }
 
-    private fun resolveEventForWidgetSync(context: Context, appWidgetId: Int): CountdownEvent? {
+    fun resolveEventForWidgetSync(context: Context, appWidgetId: Int): CountdownEvent? {
         return try {
-            val database = AppDatabase.getInstance(context)
-            val targetEventId = getWidgetEventId(context, appWidgetId)
+            val dao = getEventDao(context)
+            val rawPrefId = getPrefs(context).getLong(PREF_PREFIX_KEY + appWidgetId, EVENT_ID_AUTO)
+            val isAuto = isWidgetAutoMode(context, appWidgetId)
 
             // 1. If widget already has an assigned event, verify it exists
-            if (targetEventId != -1L) {
-                val entity = database.eventDao().getEventByIdSync(targetEventId)
+            if (rawPrefId > 0L) {
+                val entity = dao?.getEventByIdSync(rawPrefId)
                 if (entity != null) {
                     return entity.toDomain()
+                } else {
+                    // Stale event ID detected! The associated event was deleted from DB.
+                    clearWidgetEventId(context, appWidgetId)
+                    return null
                 }
+            }
+
+            // If widget was unassigned because its dedicated event was deleted, do not hijack another event
+            if (rawPrefId == EVENT_ID_UNASSIGNED) {
+                return null
             }
 
             // 2. Check if a specific event was pinned recently
             val lastPinned = getPrefs(context).getLong("last_pinned_event_id", -1L)
-            if (lastPinned != -1L) {
-                val entity = database.eventDao().getEventByIdSync(lastPinned)
+            if (lastPinned > 0L) {
+                val entity = dao?.getEventByIdSync(lastPinned)
                 if (entity != null) {
                     setWidgetEventId(context, appWidgetId, lastPinned)
                     getPrefs(context).edit().remove("last_pinned_event_id").apply()
@@ -1260,11 +1373,13 @@ object WidgetUpdateHelper {
                         getPrefs(context).edit().remove("last_pinned_style").commit()
                     }
                     return entity.toDomain()
+                } else {
+                    getPrefs(context).edit().remove("last_pinned_event_id").apply()
                 }
             }
 
-            // 3. Fallback to all events in database
-            val allEntities = database.eventDao().allEventsSync
+            // 3. Auto mode (or initial unconfigured placement where rawPrefId == EVENT_ID_AUTO):
+            val allEntities = dao?.allEventsSync
             if (!allEntities.isNullOrEmpty()) {
                 val allEvents = allEntities.map { it.toDomain() }
                 val now = System.currentTimeMillis()
@@ -1287,7 +1402,9 @@ object WidgetUpdateHelper {
                     .firstOrNull { it.getEffectiveTargetEpochMillis(now) >= now }
                     ?: allEvents.first())
 
-                setWidgetEventId(context, appWidgetId, upcoming.id)
+                if (!isAuto) {
+                    setWidgetEventId(context, appWidgetId, upcoming.id)
+                }
 
                 val pinnedThemeId = getPrefs(context).getString("last_pinned_theme_id", null)
                 val initialTheme = if (pinnedThemeId != null) {
@@ -1396,12 +1513,26 @@ object WidgetUpdateHelper {
     }
 
     fun updateWidgetsForEventSync(context: Context, eventId: Long) {
-        val appWidgetManager = AppWidgetManager.getInstance(context)
+        val appWidgetManager = try { AppWidgetManager.getInstance(context) } catch (_: Exception) { null }
         val circleComponent = ComponentName(context, CircleCountdownWidgetProvider::class.java)
-        val circleIds = appWidgetManager.getAppWidgetIds(circleComponent)
+        val circleIds = try { appWidgetManager?.getAppWidgetIds(circleComponent) ?: IntArray(0) } catch (_: Exception) { IntArray(0) }
         val mediumComponent = ComponentName(context, MediumCountdownWidgetProvider::class.java)
-        val mediumIds = appWidgetManager.getAppWidgetIds(mediumComponent)
-        val allIds = circleIds + mediumIds
+        val mediumIds = try { appWidgetManager?.getAppWidgetIds(mediumComponent) ?: IntArray(0) } catch (_: Exception) { IntArray(0) }
+        val allIds = (circleIds + mediumIds).distinct()
+
+        // Fetch fresh domain event from database
+        val dao = getEventDao(context)
+        val updatedEvent = try {
+            dao?.getEventByIdSync(eventId)?.toDomain()
+        } catch (_: Exception) {
+            null
+        }
+
+        if (updatedEvent == null) {
+            // Event has been deleted: trigger event deletion lifecycle and cleanup
+            handleEventDeletedSync(context, eventId)
+            return
+        }
 
         // Evict cached event for all widgets assigned to this event
         for (id in allIds) {
@@ -1411,24 +1542,166 @@ object WidgetUpdateHelper {
             }
         }
 
-        // Fetch fresh domain event from database
-        val database = AppDatabase.getInstance(context)
-        val updatedEvent = try {
-            database.eventDao().getEventByIdSync(eventId)?.toDomain()
-        } catch (_: Exception) {
-            null
-        }
+        if (appWidgetManager != null) {
+            for (id in circleIds) {
+                if (getWidgetEventId(context, id) == eventId) {
+                    updateCircleWidgetSync(context, appWidgetManager, id, updatedEvent)
+                }
+            }
 
-        for (id in circleIds) {
-            if (getWidgetEventId(context, id) == eventId) {
-                updateCircleWidgetSync(context, appWidgetManager, id, updatedEvent)
+            for (id in mediumIds) {
+                if (getWidgetEventId(context, id) == eventId) {
+                    updateMediumWidgetSync(context, appWidgetManager, id, updatedEvent)
+                }
+            }
+        }
+    }
+
+    /**
+     * Handles event deletion:
+     * - Identifies all widget instances associated with the deleted event ID.
+     * - Preserves widgets associated with other valid events.
+     * - Attempts to remove obsolete widget instances if supported by the Android launcher.
+     * - Respects Android launcher limitations (third-party apps cannot forcibly remove pinned widgets).
+     * - Clears stale event ID, theme, and cached state from SharedPreferences and memory.
+     * - Synchronously refreshes affected widgets to the fallback empty state with no stale countdown data.
+     * - Re-evaluates Auto widgets and AlarmManager schedules.
+     */
+    fun handleEventDeletedSync(context: Context, deletedEventId: Long): List<WidgetRemovalResult> {
+        val removalResults = mutableListOf<WidgetRemovalResult>()
+        val allWidgetIds = getAllInstalledWidgetIds(context)
+        val appWidgetManager = try { AppWidgetManager.getInstance(context) } catch (_: Exception) { null }
+        val circleIds = try {
+            appWidgetManager?.getAppWidgetIds(ComponentName(context, CircleCountdownWidgetProvider::class.java))?.toSet() ?: emptySet()
+        } catch (_: Exception) { emptySet() }
+        val mediumIds = try {
+            appWidgetManager?.getAppWidgetIds(ComponentName(context, MediumCountdownWidgetProvider::class.java))?.toSet() ?: emptySet()
+        } catch (_: Exception) { emptySet() }
+
+        val affectedWidgetIds = mutableListOf<Int>()
+        val autoWidgetIds = mutableListOf<Int>()
+
+        for (id in allWidgetIds) {
+            val assignedId = getRawWidgetEventId(context, id)
+            if (assignedId == deletedEventId) {
+                affectedWidgetIds.add(id)
+            } else if (assignedId == EVENT_ID_AUTO || isWidgetAutoMode(context, id)) {
+                autoWidgetIds.add(id)
             }
         }
 
-        for (id in mediumIds) {
-            if (getWidgetEventId(context, id) == eventId) {
-                updateMediumWidgetSync(context, appWidgetManager, id, updatedEvent)
+        // 1. Process widgets dedicated to the deleted event
+        for (id in affectedWidgetIds) {
+            val removalResult = removeWidgetInstanceIfSupported(context, id)
+            removalResults.add(removalResult)
+
+            // Clear stale state for this widget
+            clearWidgetEventId(context, id)
+            eventCache.remove(id)
+
+            // If not removed by launcher (unavoidable Android launcher limitation), refresh to clean empty state
+            if (!removalResult.isRemoved && appWidgetManager != null) {
+                if (circleIds.contains(id)) {
+                    updateCircleWidgetSync(context, appWidgetManager, id, event = null)
+                } else if (mediumIds.contains(id)) {
+                    updateMediumWidgetSync(context, appWidgetManager, id, event = null)
+                } else {
+                    updateCircleWidgetSync(context, appWidgetManager, id, event = null)
+                    updateMediumWidgetSync(context, appWidgetManager, id, event = null)
+                }
             }
+        }
+
+        // 2. Clear any pending pinned event preferences if they match the deleted event
+        val prefs = getPrefs(context)
+        if (prefs.getLong("last_pinned_event_id", -1L) == deletedEventId) {
+            prefs.edit()
+                .remove("last_pinned_event_id")
+                .remove("last_pinned_theme_id")
+                .remove("last_pinned_style")
+                .apply()
+        }
+
+        // 3. Update Auto widgets (if any) to re-evaluate against remaining events
+        for (id in autoWidgetIds) {
+            eventCache.remove(id)
+            val newEvent = resolveEventForWidgetSync(context, id)
+            if (appWidgetManager != null) {
+                if (circleIds.contains(id)) {
+                    updateCircleWidgetSync(context, appWidgetManager, id, event = newEvent)
+                } else if (mediumIds.contains(id)) {
+                    updateMediumWidgetSync(context, appWidgetManager, id, event = newEvent)
+                }
+            }
+        }
+
+        // 4. Update scheduled alarms and live ticker
+        scheduleNextWidgetUpdate(context)
+        if (!anyWidgetHasActiveCountdownWithSeconds(context)) {
+            stopLiveTicker()
+        }
+
+        return removalResults
+    }
+
+    fun handleEventDeleted(context: Context, deletedEventId: Long) {
+        CoroutineScope(Dispatchers.IO).launch {
+            handleEventDeletedSync(context, deletedEventId)
+        }
+    }
+
+    /**
+     * Handles clearing all events in database:
+     * - Cleans stale event IDs and state for all installed widgets.
+     * - Resets all widgets to clean empty state without stale countdown data.
+     * - Cancels all scheduled alarms and stops live ticker.
+     */
+    fun handleAllEventsClearedSync(context: Context): List<WidgetRemovalResult> {
+        val removalResults = mutableListOf<WidgetRemovalResult>()
+        val allWidgetIds = getAllInstalledWidgetIds(context)
+        val appWidgetManager = try { AppWidgetManager.getInstance(context) } catch (_: Exception) { null }
+        val circleIds = try {
+            appWidgetManager?.getAppWidgetIds(ComponentName(context, CircleCountdownWidgetProvider::class.java))?.toSet() ?: emptySet()
+        } catch (_: Exception) { emptySet() }
+        val mediumIds = try {
+            appWidgetManager?.getAppWidgetIds(ComponentName(context, MediumCountdownWidgetProvider::class.java))?.toSet() ?: emptySet()
+        } catch (_: Exception) { emptySet() }
+
+        for (id in allWidgetIds) {
+            val removalResult = removeWidgetInstanceIfSupported(context, id)
+            removalResults.add(removalResult)
+
+            clearWidgetEventId(context, id)
+            eventCache.remove(id)
+
+            if (!removalResult.isRemoved && appWidgetManager != null) {
+                if (circleIds.contains(id)) {
+                    updateCircleWidgetSync(context, appWidgetManager, id, event = null)
+                } else if (mediumIds.contains(id)) {
+                    updateMediumWidgetSync(context, appWidgetManager, id, event = null)
+                } else {
+                    updateCircleWidgetSync(context, appWidgetManager, id, event = null)
+                    updateMediumWidgetSync(context, appWidgetManager, id, event = null)
+                }
+            }
+        }
+
+        val prefs = getPrefs(context)
+        prefs.edit()
+            .remove("last_pinned_event_id")
+            .remove("last_pinned_theme_id")
+            .remove("last_pinned_style")
+            .apply()
+
+        cancelScheduledUpdates(context)
+        stopLiveTicker()
+
+        return removalResults
+    }
+
+    fun handleAllEventsCleared(context: Context) {
+        CoroutineScope(Dispatchers.IO).launch {
+            handleAllEventsClearedSync(context)
         }
     }
 
@@ -1454,7 +1727,7 @@ object WidgetUpdateHelper {
         scheduleNextWidgetUpdate(context)
 
         // Ensure live ticker is started if screen is on
-        mainHandler.post {
+        mainHandler?.post {
             startLiveTicker(context)
         }
     }
@@ -1493,7 +1766,7 @@ object WidgetUpdateHelper {
         val hasAnySeconds = anyWidgetHasSecondsEnabled(context)
         val nowMillis = System.currentTimeMillis()
 
-        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val powerManager = try { context.getSystemService(Context.POWER_SERVICE) as? PowerManager } catch (_: Exception) { null }
         val isInteractive = powerManager?.isInteractive ?: true
 
         // Next midnight in local time zone
@@ -1510,24 +1783,27 @@ object WidgetUpdateHelper {
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val database = AppDatabase.getInstance(context)
-                val allEvents = database.eventDao().allEventsSync
-                if (!allEvents.isNullOrEmpty()) {
-                    val nextEventTarget = allEvents
-                        .map { it.toDomain().getEffectiveTargetEpochMillis(nowMillis) }
-                        .filter { it > nowMillis }
-                        .minOrNull()
+                val dao = getEventDao(context)
+                val allEvents = dao?.allEventsSync
+                if (allEvents.isNullOrEmpty()) {
+                    cancelScheduledUpdates(context)
+                    return@launch
+                }
 
-                    if (nextEventTarget != null && nextEventTarget < triggerAtMillis) {
-                        triggerAtMillis = nextEventTarget
-                    }
+                val nextEventTarget = allEvents
+                    .map { it.toDomain().getEffectiveTargetEpochMillis(nowMillis) }
+                    .filter { it > nowMillis }
+                    .minOrNull()
+
+                if (nextEventTarget != null && nextEventTarget < triggerAtMillis) {
+                    triggerAtMillis = nextEventTarget
                 }
 
                 if (triggerAtMillis <= nowMillis) {
                     triggerAtMillis = nowMillis + 15_000L
                 }
 
-                val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return@launch
+                val alarmManager = try { context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager } catch (_: Exception) { null } ?: return@launch
                 val intent = Intent(context, CircleCountdownWidgetProvider::class.java).apply {
                     action = ACTION_SCHEDULED_WIDGET_UPDATE
                 }
@@ -1559,7 +1835,7 @@ object WidgetUpdateHelper {
 
     fun cancelScheduledUpdates(context: Context) {
         try {
-            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+            val alarmManager = try { context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager } catch (_: Exception) { null } ?: return
             val intent = Intent(context, CircleCountdownWidgetProvider::class.java).apply {
                 action = ACTION_SCHEDULED_WIDGET_UPDATE
             }
